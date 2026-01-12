@@ -1,13 +1,12 @@
 import streamlit as st
 import tempfile
+import re
 
 from validator.vobo import run_vobo
 from llm.intent_classifier import classify_intent
-from llm.advisor import explain_error
+from llm.advisor import explain_errors, explain_error  # backward compat
 
-# -------------------------------------------------
-# Configuración de la página
-# -------------------------------------------------
+
 st.set_page_config(
     page_title="Agente VoBo – Matriz de Transformación",
     layout="wide"
@@ -15,9 +14,10 @@ st.set_page_config(
 
 st.title("🤖 Agente de Gobierno – VoBo Matriz de Transformación")
 
-# -------------------------------------------------
-# Inicialización de estado (OBLIGATORIO)
-# -------------------------------------------------
+
+# -----------------------------
+# Session state
+# -----------------------------
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -25,80 +25,124 @@ if "excel_path" not in st.session_state:
     st.session_state.excel_path = None
 
 if "context" not in st.session_state:
-    st.session_state.context = {
-        "errors": []
-    }
+    st.session_state.context = {"errors": []}
 
 if "file_loaded" not in st.session_state:
     st.session_state.file_loaded = False
 
-# -------------------------------------------------
-# Mostrar historial del chat
-# -------------------------------------------------
+if "uploader_key" not in st.session_state:
+    st.session_state.uploader_key = 0
+
+if "last_uploaded_name" not in st.session_state:
+    st.session_state.last_uploaded_name = None
+
+
+# -----------------------------
+# Render chat history
+# -----------------------------
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# -------------------------------------------------
-# Carga de archivo Excel
-# -------------------------------------------------
+
+# -----------------------------
+# File uploader
+# -----------------------------
 uploaded_file = st.file_uploader(
     "📎 Carga la matriz de transformación (Excel)",
-    type=["xlsx"]
+    type=["xlsx"],
+    key=f"excel_uploader_{st.session_state.uploader_key}"
 )
 
-if uploaded_file and not st.session_state.file_loaded:
+should_load_file = (
+    uploaded_file is not None and (
+        (not st.session_state.file_loaded)
+        or (uploaded_file.name != st.session_state.last_uploaded_name)
+    )
+)
+
+if should_load_file:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
         tmp.write(uploaded_file.read())
         st.session_state.excel_path = tmp.name
 
     st.session_state.file_loaded = True
+    st.session_state.last_uploaded_name = uploaded_file.name
+    st.session_state.context["errors"] = []
 
     st.session_state.messages.append({
         "role": "assistant",
-        "content": "📄 Archivo cargado correctamente. Cuando quieras, dime **valida el VoBo**."
+        "content": "📄 Archivo cargado correctamente. Cuando quieras, escribe **valida** para ejecutar el VoBo."
     })
 
     st.rerun()
 
-# -------------------------------------------------
-# Botón para cargar otro archivo
-# -------------------------------------------------
+
+# -----------------------------
+# Load another file
+# -----------------------------
 if st.session_state.file_loaded:
     if st.button("🔄 Cargar otro archivo"):
         st.session_state.file_loaded = False
         st.session_state.excel_path = None
         st.session_state.context["errors"] = []
+        st.session_state.last_uploaded_name = None
+        st.session_state.uploader_key += 1
+
         st.session_state.messages.append({
             "role": "assistant",
             "content": "Puedes cargar un nuevo archivo Excel cuando quieras."
         })
+
         st.rerun()
 
-# -------------------------------------------------
-# Entrada de chat
-# -------------------------------------------------
+
+# -----------------------------
+# Intent shortcuts (NO LLM)
+# -----------------------------
+def quick_intent(user_message: str) -> str | None:
+    """
+    Atajo determinista para no depender del LLM con palabras clave críticas.
+    """
+    text = user_message.strip().lower()
+
+    # valida / validar / valida vobo / validar vobo
+    if re.fullmatch(r"(valida|validar)(\s+vobo)?", text):
+        return "VALIDATE_VOBO"
+
+    # explica / explicar
+    if text.startswith("explica") or text.startswith("explicar"):
+        return "EXPLAIN_ERROR"
+
+    # ayuda
+    if text in {"ayuda", "help", "?"}:
+        return "HELP"
+
+    return None
+
+
+# -----------------------------
+# Chat input
+# -----------------------------
 user_input = st.chat_input("Escribe tu mensaje...")
 
 if user_input:
-    # Guardar mensaje del usuario
-    st.session_state.messages.append({
-        "role": "user",
-        "content": user_input
-    })
-
+    st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # -------------------------------------------------
-    # Clasificación de intención
-    # -------------------------------------------------
-    intent = classify_intent(user_input)
+    # 1) primero intent determinista
+    intent = quick_intent(user_input)
+
+    # 2) si no aplica, usa LLM
+    if intent is None:
+        intent = classify_intent(user_input)
+
     response = ""
 
-    # -------------------------------------------------
-    # VALIDAR VOBO
-    # -------------------------------------------------
+    # -------------------------
+    # VALIDATE VOBO
+    # -------------------------
     if intent == "VALIDATE_VOBO":
         if not st.session_state.excel_path:
             response = "❗ Primero debes cargar un archivo Excel."
@@ -106,60 +150,74 @@ if user_input:
             with st.spinner("Validando matriz de transformación..."):
                 result = run_vobo(st.session_state.excel_path)
 
-            # Guardar errores en memoria
-            st.session_state.context["errors"] = result["details"]
+            issues = result.get("details", [])
+            st.session_state.context["errors"] = issues
 
-            if result["vobo"]:
-                response = f"✅ **{result['message']}**"
+            # Separa bloqueantes vs warnings (si trae blocks_vobo)
+            blocking = [e for e in issues if e.get("blocks_vobo") is True or e.get("level") == "ERROR"]
+            warnings = [e for e in issues if e.get("level") == "WARN" and e not in blocking]
+
+            if result.get("vobo") is True:
+                response = "✅ **La matriz de transformación ha aprobado el VoBo**\n\n"
             else:
-                response = f"❌ **{result['message']}**\n\n"
-                response += "Se detectaron los siguientes errores:\n"
-                for err in result["details"]:
-                    response += f"- Hoja **{err.get('sheet', 'General')}**"
-                    if "statusCode" in err:
-                        response += f" | StatusCode `{err['statusCode']}`"
-                    if "attribute" in err:
-                        response += f" | Atributo `{err['attribute']}`"
+                response = "❌ **La matriz de transformación NO aprueba el VoBo**\n\n"
+
+            if blocking:
+                response += "## ❌ Errores que bloquean\n"
+                for err in blocking:
+                    sheet = err.get("sheet", "¿?")
+                    attr = err.get("attribute", "¿?")
+                    msg = err.get("message", "")
+                    response += f"- Hoja **{sheet}** | Atributo `{attr}`"
+                    if msg:
+                        response += f"  \n  ↳ {msg}"
+                    response += "\n"
+                response += "\n"
+
+            if warnings:
+                response += "## ⚠️ Advertencias\n"
+                for err in warnings:
+                    sheet = err.get("sheet", "¿?")
+                    attr = err.get("attribute", "¿?")
+                    msg = err.get("message", "")
+                    response += f"- Hoja **{sheet}** | Atributo `{attr}`"
+                    if msg:
+                        response += f"  \n  ↳ {msg}"
                     response += "\n"
 
-                response += "\nPuedes pedirme que **explique un error**."
+            if issues:
+                response += "\nPuedes pedirme que **explique un error o advertencia** (por hoja/atributo)."
 
-    # -------------------------------------------------
-    # EXPLICAR ERROR
-    # -------------------------------------------------
+    # -------------------------
+    # EXPLAIN ERROR
+    # -------------------------
     elif intent == "EXPLAIN_ERROR":
-        errors = st.session_state.context.get("errors", [])
-
-        if not errors:
-            response = "No hay errores para explicar. Primero valida el VoBo."
+        issues = st.session_state.context.get("errors", [])
+        if not issues:
+            response = "No hay errores para explicar. Primero escribe **valida**."
         else:
-            response = explain_error(errors[0])
+            response = explain_errors(user_input, issues)
+            if not response.strip():
+                response = explain_error(issues[0])
 
-    # -------------------------------------------------
-    # AYUDA
-    # -------------------------------------------------
+    # -------------------------
+    # HELP
+    # -------------------------
     elif intent == "HELP":
-        response = explain_error({})
+        response = (
+            "Puedo ayudarte a:\n"
+            "- Escribe **valida** para ejecutar el VoBo\n"
+            "- Escribe **explica** + hoja/atributo para detallar un error\n"
+        )
 
-    # -------------------------------------------------
-    # FUERA DE ALCANCE
-    # -------------------------------------------------
     else:
         response = (
             "Estoy enfocado en validar **Matrices de Transformación**.\n\n"
-            "Puedes pedirme:\n"
-            "- **Validar el VoBo**\n"
-            "- **Explicar errores**\n"
-            "- Ayuda sobre las validaciones disponibles"
+            "Comandos:\n"
+            "- **valida**\n"
+            "- **explica ...**\n"
         )
 
-    # -------------------------------------------------
-    # Mostrar respuesta del agente
-    # -------------------------------------------------
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": response
-    })
-
+    st.session_state.messages.append({"role": "assistant", "content": response})
     with st.chat_message("assistant"):
         st.markdown(response)
