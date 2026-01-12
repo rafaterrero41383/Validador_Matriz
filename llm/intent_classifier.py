@@ -10,10 +10,6 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 SYSTEM_PROMPT = """
 Eres un clasificador de intención para un agente de gobierno técnico.
 
-Tu única tarea es clasificar la intención del usuario.
-No respondas preguntas.
-No expliques nada.
-
 Devuelve SOLO una de estas etiquetas exactas:
 - VALIDATE_VOBO
 - EXPLAIN_ERROR
@@ -21,7 +17,25 @@ Devuelve SOLO una de estas etiquetas exactas:
 - OUT_OF_SCOPE
 """
 
+KEYWORD_VALIDATE = {
+    "valida",
+    "validar",
+    "validar vobo",
+    "valida vobo",
+    "valida el vobo",
+    "validar el vobo",
+    "vobo",
+}
+
 def classify_intent(user_message: str) -> str:
+    text = user_message.lower().strip()
+
+    # 🔥 ATAJO DETERMINISTA (CRÍTICO)
+    for kw in KEYWORD_VALIDATE:
+        if kw in text:
+            return "VALIDATE_VOBO"
+
+    # --- fallback LLM ---
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[

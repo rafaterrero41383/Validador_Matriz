@@ -1,113 +1,171 @@
-# llm/advisor.py
-import os
-from dotenv import load_dotenv
-from openai import OpenAI
+import re
+from typing import List, Dict, Any
 
-load_dotenv()
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+def _norm(s: str) -> str:
+    if not isinstance(s, str):
+        return ""
+    s = s.replace("\xa0", " ")
+    s = re.sub(r"\s+", " ", s)
+    return s.strip().lower()
 
-# -------------------------------------------------
-# 1. SYSTEM PROMPT (IDENTIDAD DEL AGENTE)
-# -------------------------------------------------
 
-SYSTEM_PROMPT = """
-Eres un Agente de Gobierno Técnico especializado en la validación de Matrices de Transformación
-para arquitecturas de microservicios.
+def _norm_attr(s: str) -> str:
+    if not isinstance(s, str):
+        return ""
+    s = s.replace("\xa0", "")
+    s = re.sub(r"\s+", "", s)
+    return s.strip()
 
-Tu función principal es:
-- Asistir al usuario en la validación de matrices de transformación en formato Excel.
-- Explicar errores detectados por validadores deterministas.
-- Sugerir correcciones técnicas alineadas a buenas prácticas de gobierno de APIs y backend.
 
-Reglas estrictas:
-- NO decides si una matriz aprueba o no el VoBo.
-- El VoBo lo determina exclusivamente el motor de validación.
-- NO inventas errores ni validaciones.
-- NO contradices el resultado del validador.
-- NO suavizas mensajes institucionales.
-
-Tu rol es de asesor técnico, no de juez.
-
-Estilo de comunicación:
-- Claro, directo y profesional.
-- Lenguaje técnico, pero entendible.
-- Sin emojis innecesarios.
-- Sin opiniones personales.
-- Sin exageraciones.
-
-Contexto:
-- La matriz de transformación es un artefacto contractual.
-- La consistencia entre diseño, backend y base de datos es obligatoria.
-- El incumplimiento de reglas implica rechazo del VoBo.
-"""
-
-# -------------------------------------------------
-# 2. PROMPTS ESPECIALIZADOS
-# -------------------------------------------------
-
-STATUSCODE_PROMPT = """
-Analiza el siguiente error de validación relacionado con StatusCode:
-
-{error}
-
-Explica:
-1. Qué regla de gobierno se incumple.
-2. Por qué es un problema técnico o contractual.
-3. Qué debe corregirse exactamente en la matriz.
-
-No repitas el mensaje institucional.
-No inventes reglas nuevas.
-Sé conciso y técnico.
-"""
-
-BACKEND_PROMPT = """
-Analiza el siguiente error de validación de mapeo Backend–Base de Datos:
-
-{error}
-
-Explica:
-- Si el atributo falta en la consulta SQL o en la columna Atributo.
-- Qué impacto tiene en la inserción de datos.
-- Cómo debe corregirse la matriz para cumplir el contrato backend.
-
-Mantén un lenguaje técnico y directo.
-"""
-
-GENERAL_HELP_PROMPT = """
-El usuario está trabajando con una matriz de transformación.
-
-Indica de forma clara:
-- Qué validaciones puede ejecutar el agente.
-- Qué tipo de errores puede detectar.
-- Qué acciones puede solicitar.
-
-No describas implementación interna.
-No menciones librerías ni código.
-"""
-
-# -------------------------------------------------
-# 3. ORQUESTADOR
-# -------------------------------------------------
-
-def explain_error(error: dict) -> str:
+def _extract_sheet_numbers(user_message: str) -> List[str]:
     """
-    Decide qué prompt usar según el tipo de error
+    Extrae "hoja 2", "Hoja 3", etc. Devuelve ["Hoja 2", "Hoja 3"]
     """
-    if error.get("section") == "StatusCode":
-        prompt = STATUSCODE_PROMPT.format(error=error)
-    elif error.get("attribute"):
-        prompt = BACKEND_PROMPT.format(error=error)
-    else:
-        prompt = GENERAL_HELP_PROMPT
+    msg = _norm(user_message)
+    nums = re.findall(r"\bhoja\s*(\d+)\b", msg)
+    return [f"Hoja {n}" for n in nums]
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.2
+
+def _extract_attribute_candidates(user_message: str) -> List[str]:
+    """
+    Extrae posibles atributos del texto del usuario:
+    - tokens con puntos: a.b.c
+    - tokens con []: a[].b[].c
+    - acepta que vengan con backticks
+    """
+    raw = user_message or ""
+    # primero: lo que venga entre backticks
+    ticks = re.findall(r"`([^`]+)`", raw)
+    candidates = list(ticks)
+
+    # luego: tokens que parezcan paths (con . y opcional [])
+    # Ej: partyReferenceDataDirectoryEntry[].directDebitMandate[].amount
+    paths = re.findall(r"([A-Za-z_][A-Za-z0-9_\[\]\.]{3,})", raw)
+    for p in paths:
+        if "." in p:
+            candidates.append(p)
+
+    # normalizar y deduplicar manteniendo orden
+    seen = set()
+    out = []
+    for c in candidates:
+        c2 = _norm_attr(c)
+        if not c2 or c2 in seen:
+            continue
+        seen.add(c2)
+        out.append(c2)
+    return out
+
+
+def _pick_relevant_errors(user_message: str, errors: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Selecciona errores relevantes según:
+    - atributos mencionados
+    - hojas mencionadas
+    Si no hay match, devuelve los primeros 3 para no dejar al usuario en el aire.
+    """
+    attrs = set(_extract_attribute_candidates(user_message))
+    sheets = set(_extract_sheet_numbers(user_message))
+
+    picked = []
+
+    for e in errors:
+        e_attr = _norm_attr(e.get("attribute", ""))
+        e_sheet = str(e.get("sheet", "")).strip()
+
+        if attrs and e_attr in attrs:
+            picked.append(e)
+            continue
+        if sheets and e_sheet in sheets:
+            picked.append(e)
+            continue
+
+    if picked:
+        # dedupe por (sheet, attribute, category)
+        seen = set()
+        unique = []
+        for e in picked:
+            key = (e.get("sheet"), e.get("attribute"), e.get("category"))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(e)
+        return unique
+
+    return errors[:3]  # fallback
+
+
+def _explain_one_error(e: Dict[str, Any]) -> str:
+    sheet = e.get("sheet", "General")
+    attr = e.get("attribute", "")
+    cat = (e.get("category") or "").upper()
+    msg = e.get("message", "").strip()
+
+    # Plantillas por categoría (sin inventar DB/SQL)
+    if cat == "CONTRACT":
+        return (
+            f"**Hoja {sheet} | Atributo `{attr}`**\n\n"
+            f"Este error es de **Contrato Canónico (Hoja 1)**.\n\n"
+            f"- **Qué significa:** el atributo aparece en una hoja posterior (mapeo/implementación), pero el validador no lo encuentra definido en la **Hoja 1** (o en hojas previas, según la regla).\n"
+            f"- **Por qué bloquea VoBo:** rompe el contrato; hay implementación sin definición contractual.\n"
+            f"- **Cómo corregir:**\n"
+            f"  1) Si el atributo *sí debe existir*, agrégalo/corrige su definición en **Hoja 1** (Request o Response, según aplique) con el path exacto.\n"
+            f"  2) Si el atributo *no debe existir*, elimínalo del mapeo en la hoja técnica.\n\n"
+            f"{('**Detalle del motor:** ' + msg) if msg else ''}"
+        )
+
+    if cat == "HEADERS":
+        return (
+            f"**Hoja {sheet} | Header `{attr}`**\n\n"
+            f"Falta un **header obligatorio** para capa **Pro_**.\n\n"
+            f"- **Qué significa:** el header requerido no está declarado en la sección Headers/Entrada.\n"
+            f"- **Por qué bloquea VoBo:** rompe el estándar contractual de consumo.\n"
+            f"- **Cómo corregir:** agrega el header en Hoja 1 (Headers) y refléjalo en hojas siguientes si aplica.\n\n"
+            f"{('**Detalle del motor:** ' + msg) if msg else ''}"
+        )
+
+    if cat == "CONSISTENCY":
+        return (
+            f"**Hoja {sheet} | Atributo `{attr}`**\n\n"
+            f"Este error es de **Consistencia** con la Hoja 1.\n\n"
+            f"- **Qué significa:** la **obligatoriedad** y/o el **tipo de dato** en esta hoja no coincide con lo definido en la Hoja 1.\n"
+            f"- **Por qué bloquea VoBo:** el contrato queda ambiguo/inconsistente.\n"
+            f"- **Cómo corregir:** alinear `Obligatoriedad` y `Tipo` con la definición de Hoja 1 (match exacto).\n\n"
+            f"{('**Detalle del motor:** ' + msg) if msg else ''}"
+        )
+
+    if cat == "SEMANTIC":
+        return (
+            f"**Hoja {sheet} | Atributo `{attr}`**\n\n"
+            f"Esto es una **sugerencia BIAN Semantic API** (no necesariamente bloqueante si decidiste flexibilidad).\n\n"
+            f"- **Qué significa:** el nombre/estructura del atributo podría no alinearse a semántica BIAN v12.\n"
+            f"- **Qué hacer:** evaluar renombrar o justificar excepción en gobierno.\n\n"
+            f"{('**Detalle del motor:** ' + msg) if msg else ''}"
+        )
+
+    # fallback
+    return (
+        f"**Hoja {sheet} | `{attr}`**\n\n"
+        f"{msg or 'Error detectado por el motor. Revisa la definición en Hoja 1 y consistencia entre hojas.'}"
     )
 
-    return response.choices[0].message.content.strip()
+
+def explain_errors(user_message: str, errors: List[Dict[str, Any]]) -> str:
+    picked = _pick_relevant_errors(user_message, errors)
+
+    # si el usuario pidió explícitamente dos atributos, los explicamos ambos (si aparecen)
+    blocks = []
+    for e in picked:
+        blocks.append(_explain_one_error(e))
+
+    if not blocks:
+        return "No pude identificar el error que quieres explicar. Intenta pegando el **Atributo** tal como aparece o indicando **Hoja N**."
+
+    # Si son varios, se separan de forma limpia
+    return "\n\n---\n\n".join(blocks)
+
+
+# Backward compat: explica solo uno
+def explain_error(error: Dict[str, Any]) -> str:
+    return _explain_one_error(error)
