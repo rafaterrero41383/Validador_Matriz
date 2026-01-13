@@ -1,44 +1,37 @@
 import pandas as pd
 import re
 
-# =============================================================================
-# 1. MATRIZ DE COMPATIBILIDAD DE TIPOS
-# =============================================================================
-
 TYPE_FAMILIES = {
-    # Familia Texto
-    "string": "TEXT", "varchar": "TEXT", "char": "TEXT", "text": "TEXT", "nvarchar": "TEXT",
-    # Familia Numérica
+    "string": "TEXT", "varchar": "TEXT", "char": "TEXT", "text": "TEXT", "nvarchar": "TEXT", "alphanumeric": "TEXT",
     "number": "NUMBER", "decimal": "NUMBER", "int": "NUMBER", "integer": "NUMBER",
     "numeric": "NUMBER", "float": "NUMBER", "double": "NUMBER", "smallint": "NUMBER", "bigint": "NUMBER",
-    # Familia Fecha
     "date": "DATE", "timestamp": "DATE", "datetime": "DATE", "time": "DATE",
-    # Familia Booleana
     "boolean": "BOOL", "bit": "BOOL", "tinyint": "BOOL", "bool": "BOOL",
-    # Otros
     "object": "OBJECT", "array": "ARRAY"
 }
 
 KEYWORDS_TO_SKIP = {
     "origen", "atributo", "tipo de dato", "backend", "servicio",
-    "backend - input", "backend - output", "nan", "none", "tipo",
-    "mapeo transacción", "función", "destino", "obligatoriedad"
+    "backend - input", "backend - output", "nan", "none", "n/a", "tipo",
+    "mapeo transacción", "función", "destino", "obligatoriedad", "descripción",
+    "requerido", "mandatory", "field", "name", "nombre", "column",
+    "request body", "headers", "response body", "entrada", "salida"
 }
-
-CONTRACT_SHEET = "Hoja 1"
 
 
 # =============================================================================
-# FUNCIONES AUXILIARES
+# HELPERS
 # =============================================================================
 
 def _normalize(text: str) -> str:
-    if not isinstance(text, str): return ""
-    return text.strip().lower()
+    return text.strip().lower() if isinstance(text, str) else ""
 
 
 def _loose_normalize(text: str) -> str:
-    return _normalize(text).replace("_", "").replace(" ", "")
+    if not isinstance(text, str): return ""
+    clean = str(text).strip().lower()
+    if "." in clean: clean = clean.split(".")[-1]
+    return clean.replace("_", "").replace(" ", "")
 
 
 def _get_type_family(type_str: str) -> str:
@@ -47,134 +40,239 @@ def _get_type_family(type_str: str) -> str:
     return TYPE_FAMILIES.get(clean, "UNKNOWN")
 
 
-def _load_contract_types(excel_path: str) -> dict:
-    try:
-        df = pd.read_excel(excel_path, sheet_name=CONTRACT_SHEET, header=None)
-    except:
-        return {}
-    contract_map = {}
-    attr_idx, type_idx, start_row = -1, -1, -1
-    for i, row in df.iterrows():
-        row_str = [str(v).strip().lower() for v in row]
-        if "atributo" in row_str:
-            try:
-                attr_idx = row_str.index("atributo")
-                type_idx = next((idx for idx, val in enumerate(row_str) if val in ["tipo", "tipo de dato"]), -1)
-                if attr_idx != -1 and type_idx != -1:
-                    start_row = i
-                    break
-            except:
-                continue
-    if start_row != -1:
-        for i in range(start_row + 1, len(df)):
-            row = df.iloc[i]
-            attr = str(row.iloc[attr_idx]).strip()
-            dtype = str(row.iloc[type_idx]).strip().lower()
-            if attr and attr.lower() != "nan":
-                contract_map[_loose_normalize(attr)] = dtype
-    return contract_map
+def _is_mandatory(val: str) -> bool:
+    v = _normalize(str(val))
+    return v in ["si", "yes", "s", "y", "true", "requerido", "required", "mandatory", "mandatorio", "1"]
+
+
+def _validate_array_syntax(attr_name, dtype, sheet, issues_list):
+    name = str(attr_name).strip()
+    dt = str(dtype).strip().lower()
+    if not name or not dt or dt == "nan": return
+
+    has_brackets_at_end = name.endswith("[]")
+    is_array = "array" in dt
+
+    if has_brackets_at_end and not is_array:
+        issues_list.append({
+            "sheet": sheet, "attribute": name, "level": "WARN", "category": "SYNTAX",
+            "message": f"Sintaxis: Termina en '[]' pero el tipo es '{dtype}'. Debería ser 'Array'."
+        })
+    elif is_array and not has_brackets_at_end:
+        issues_list.append({
+            "sheet": sheet, "attribute": name, "level": "WARN", "category": "SYNTAX",
+            "message": f"Sintaxis: Es tipo 'Array' pero no termina en '[]'."
+        })
 
 
 def _find_table_structure(df: pd.DataFrame):
+    ATTR = ["atributo", "campo", "field", "name", "nombre", "column"]
+    TYPE = ["tipo", "type", "datatype", "formato"]
+    OBLIG = ["obligatoriedad", "requerido", "mandatory", "required", "nulo"]
+
     for i, row in df.iterrows():
-        row_str = [str(val).strip().lower() for val in row]
-        attr_cols = [idx for idx, val in enumerate(row_str) if "atributo" in val]
-        type_cols = [idx for idx, val in enumerate(row_str) if "tipo" in val or "tipo de dato" in val]
-        if attr_cols and type_cols:
-            return i, attr_cols, type_cols
-    return None, [], []
+        r = [str(v).strip().lower() for v in row]
+        attr = [x for x, v in enumerate(r) if any(k == v for k in ATTR)]
+        typ = [x for x, v in enumerate(r) if any(k in v for k in TYPE) and "cambio" not in v]
+        obl = [x for x, v in enumerate(r) if any(k in v for k in OBLIG)]
+        if attr and typ: return i, attr, typ, obl
+
+    return None, [], [], []
+
+
+def _load_contract_definitions(df: pd.DataFrame, sheet_name: str, issues: list) -> dict:
+    contract_map = {}
+    header, attr_c, type_c, obl_c = _find_table_structure(df)
+    if header is None: return {}
+
+    idx_a = attr_c[0]
+    idx_t = type_c[0]
+    idx_o = obl_c[0] if obl_c else None
+
+    for i in range(len(df)):
+        if i == header: continue
+        row = df.iloc[i]
+        try:
+            raw_a = str(row.iloc[idx_a]).strip()
+            raw_t = str(row.iloc[idx_t]).strip()
+            raw_o = str(row.iloc[idx_o]).strip() if idx_o else ""
+        except:
+            continue
+
+        norm = _loose_normalize(raw_a)
+        if not raw_a or raw_a.lower() in ["nan", "n/a"]: continue
+        if norm in KEYWORDS_TO_SKIP: continue
+
+        _validate_array_syntax(raw_a, raw_t, sheet_name, issues)
+
+        fam = _get_type_family(raw_t)
+        if fam != "UNKNOWN" or _normalize(raw_o) in ["yes", "no", "si"]:
+            contract_map[norm] = {"original_name": raw_a, "type": raw_t, "mandatory": _is_mandatory(raw_o)}
+    return contract_map
 
 
 # =============================================================================
-# LÓGICA PRINCIPAL
+# SQL PARSERS (CORREGIDO PARA UPDATE)
+# =============================================================================
+
+def _extract_sql_columns(sql_text: str) -> tuple[str, set]:
+    # Limpieza: quitamos comentarios, saltos de línea y espacios extra
+    clean = re.sub(r"--.*", "", sql_text).replace("\n", " ").strip()
+    # Normalizar espacios alrededor de signos
+    clean = re.sub(r"\s*=\s*", "=", clean)
+
+    cols = set()
+
+    # --- CASO INSERT ---
+    if "INSERT INTO" in clean.upper():
+        m = re.search(r"INSERT\s+INTO\s+.*?\((.*?)\)\s*VALUES", clean, re.IGNORECASE)
+        if m:
+            for c in m.group(1).split(","):
+                if c.strip(): cols.add(_loose_normalize(c.strip()))
+            return "INSERT", cols
+
+    # --- CASO UPDATE (CORREGIDO) ---
+    if "UPDATE" in clean.upper() and "SET" in clean.upper():
+        # Estrategia: Buscar palabras seguidas de un signo =
+        # Ej: "SET status=?, date=?" -> status, date
+        # Ej: "WHERE id=?" -> id
+
+        # Regex: Captura cualquier palabra alfanumérica seguida inmediatamente de un =
+        # La limpieza previa eliminó espacios alrededor del =
+        matches = re.findall(r"([a-zA-Z0-9_\.]+)=[\?a-zA-Z0-9_']", clean)
+        for m in matches:
+            cols.add(_loose_normalize(m))
+
+        return "INSERT", cols  # Retornamos tipo INSERT para indicar "Escritura" (Input Only)
+
+    # --- CASO DELETE ---
+    if "DELETE" in clean.upper() and "FROM" in clean.upper():
+        # En DELETE solo nos importa el WHERE
+        matches = re.findall(r"([a-zA-Z0-9_\.]+)=[\?a-zA-Z0-9_']", clean)
+        for m in matches:
+            cols.add(_loose_normalize(m))
+        return "INSERT", cols
+
+    # --- CASO SELECT ---
+    if "SELECT" in clean.upper():
+        m = re.search(r"SELECT\s+(.*?)\s+FROM", clean, re.IGNORECASE)
+        if m:
+            for c in m.group(1).split(","):
+                if not c.strip(): continue
+                for part in re.split(r"\s+AS\s+|\s+", c, flags=re.IGNORECASE):
+                    if part.upper() not in ["DISTINCT", "TOP", "ALL"]:
+                        cols.add(_loose_normalize(part))
+            return "SELECT", cols
+
+    return "UNKNOWN", set()
+
+
+# =============================================================================
+# VALIDACIÓN BACKEND
 # =============================================================================
 
 def validate_backend_mapping(excel_path: str) -> dict:
     issues = []
-    contract_types = _load_contract_types(excel_path)
     xls = pd.ExcelFile(excel_path)
+    sheet_names = xls.sheet_names
+    if not sheet_names: return {"details": []}
 
-    for sheet_name in xls.sheet_names:
-        if sheet_name == CONTRACT_SHEET: continue
+    try:
+        df_c = pd.read_excel(excel_path, sheet_name=sheet_names[0], header=None)
+        c_defs = _load_contract_definitions(df_c, sheet_names[0], issues)
+    except:
+        c_defs = {}
+
+    for i in range(1, len(sheet_names)):
+        sh = sheet_names[i]
         try:
-            df_raw = pd.read_excel(excel_path, sheet_name=sheet_name, header=None)
+            df = pd.read_excel(excel_path, sheet_name=sh, header=None)
         except:
             continue
 
-        start_row, attr_cols, type_cols = _find_table_structure(df_raw)
-        if start_row is None: continue
+        start, a_cols, t_cols, o_cols = _find_table_structure(df)
+        if start is None: continue
 
-        idx_type_origin = type_cols[0] if len(type_cols) > 0 else None
-        idx_type_db = type_cols[1] if len(type_cols) > 1 else None
+        in_dest, out_orig = set(), set()
+        curr_sect = "INPUT"
 
-        defined_attributes_loose = set()
+        for r_idx in range(len(df)):
+            row = df.iloc[r_idx]
+            txt = "".join([str(x) for x in row]).lower()
 
-        for r_idx in range(start_row + 1, len(df_raw)):
-            row = df_raw.iloc[r_idx]
-            primary_val = str(row.iloc[attr_cols[0]]).strip().lower()
-            if "insert into" in primary_val or "select " in primary_val: break
-            if "backend - output" in primary_val: break
-            if primary_val in KEYWORDS_TO_SKIP: continue
-            if not primary_val or primary_val == "nan": continue
+            # Detección de secciones
+            if "backend - output" in txt:
+                curr_sect = "OUTPUT";
+                continue
+            if "backend - input" in txt:
+                curr_sect = "INPUT";
+                continue
 
-            attr_origin = str(row.iloc[attr_cols[0]]).strip()
-            type_origin = str(row.iloc[idx_type_origin]).strip().lower() if idx_type_origin is not None else ""
+            # Fin de lectura por SQL
+            if "insert into" in txt or "select " in txt or "update " in txt or "delete " in txt:
+                break
 
-            attr_db = ""
-            type_db = ""
-            if len(attr_cols) > 1: attr_db = str(row.iloc[attr_cols[-1]]).strip()
-            if idx_type_db is not None: type_db = str(row.iloc[idx_type_db]).strip().lower()
+            if r_idx <= start: continue
 
-            ref_attr = attr_db if attr_db and attr_db.lower() != "nan" else attr_origin
-            if ref_attr and ref_attr.lower() != "nan":
-                defined_attributes_loose.add(_loose_normalize(ref_attr))
+            # --- Validar que la fila no sea un header repetido o basura ---
+            try:
+                # Chequeamos la primera celda de atributo
+                cell_val = str(row.iloc[a_cols[0]]).strip().lower()
+                if cell_val in KEYWORDS_TO_SKIP or cell_val == "nan" or cell_val == "": continue
+            except:
+                continue
 
-            # --- VALIDACIÓN DE COHERENCIA (AHORA COMO SUGERENCIA) ---
-            origin_key = _loose_normalize(attr_origin)
-            if origin_key in contract_types:
-                contract_type = contract_types[origin_key]
-                family_contract = _get_type_family(contract_type)
-                family_db = _get_type_family(type_db)
+            # --- Recolección estricta ---
+            val_to_add = None
 
-                if family_db != "UNKNOWN" and family_contract != "UNKNOWN":
-                    is_obj_to_text = (family_contract == "OBJECT" and family_db == "TEXT")
+            if curr_sect == "INPUT" and len(a_cols) > 1:
+                raw = str(row.iloc[a_cols[1]]).strip()
+                if raw and raw.lower() not in ["nan", "n/a", ""]:
+                    in_dest.add(_loose_normalize(raw))
+                    val_to_add = raw
 
-                    if family_contract != family_db and not is_obj_to_text:
-                        # 🔥 CAMBIO CLAVE AQUÍ: WARN en vez de ERROR
-                        issues.append({
-                            "sheet": sheet_name,
-                            "attribute": attr_origin,
-                            "level": "WARN",  # Era ERROR
-                            "category": "CONTRACT_MISMATCH",
-                            "blocks_vobo": False,  # Era True
-                            "message": (
-                                f"El tipo de dato de Base de Datos ('{type_db}') NO es compatible con lo definido "
-                                f"en el Contrato Hoja 1 ('{contract_type}'). "
-                                f"Se sugiere cambiar el tipo de dato a {family_contract}."  # Mensaje suavizado
-                            )
-                        })
+            elif curr_sect == "OUTPUT" and len(a_cols) > 0:
+                raw = str(row.iloc[a_cols[0]]).strip()
+                # Filtrado extra fuerte para Output vacíos
+                if raw and raw.lower() not in ["nan", "n/a", ""] and not raw.isspace():
+                    out_orig.add(_loose_normalize(raw))
+                    val_to_add = raw
 
-        sheet_text = df_raw.to_string()
-        if "INSERT INTO" in sheet_text.upper():
-            issues.extend(_validate_sql_consistency(sheet_text, defined_attributes_loose, sheet_name))
+            # Validar Array Syntax (Solo si detectamos un valor real)
+            if val_to_add:
+                chk_a, chk_t = a_cols[0], t_cols[0]
+                if curr_sect == "INPUT" and len(a_cols) > 1:
+                    chk_a, chk_t = a_cols[1], (t_cols[1] if len(t_cols) > 1 else t_cols[0])
+
+                try:
+                    t_val = str(row.iloc[chk_t]).strip()
+                    if t_val and t_val.lower() != "nan":
+                        _validate_array_syntax(val_to_add, t_val, sh, issues)
+                except:
+                    pass
+
+        # --- SQL Check ---
+        sql_t, sql_c = _extract_sql_columns(df.to_string())
+
+        if sql_t == "SELECT":
+            if not out_orig:
+                issues.append({"sheet": sh, "attribute": "Estructura Output", "level": "ERROR", "blocks_vobo": True,
+                               "category": "SQL_CONSISTENCY", "message": "SELECT presente pero Backend-Output vacío."})
+            elif (out_orig - sql_c):
+                issues.append({"sheet": sh, "attribute": "SQL Consistency", "level": "ERROR", "blocks_vobo": True,
+                               "category": "SQL_CONSISTENCY",
+                               "message": f"SELECT incompleto. Faltan en SQL: {', '.join(out_orig - sql_c)}"})
+
+        elif sql_t == "INSERT":  # Aplica para INSERT, UPDATE, DELETE
+            if out_orig:
+                issues.append({"sheet": sh, "attribute": "Estructura Output", "level": "ERROR", "blocks_vobo": True,
+                               "category": "SQL_CONSISTENCY",
+                               "message": "Operación de escritura presente pero Backend-Output tiene datos (debería estar vacío)."})
+
+            missing = in_dest - sql_c
+            if missing:
+                issues.append({"sheet": sh, "attribute": "SQL Consistency", "level": "ERROR", "blocks_vobo": True,
+                               "category": "SQL_CONSISTENCY",
+                               "message": f"Operación incompleta. Atributos del mapeo no encontrados en SQL: {', '.join(missing)}"})
 
     return {"details": issues}
-
-
-def _validate_sql_consistency(text, valid_attrs_loose, sheet_name):
-    issues = []
-    matches = re.finditer(r"INSERT\s+INTO\s+.*?\((.*?)\)\s*VALUES", text, re.IGNORECASE | re.DOTALL)
-    for m in matches:
-        columns = [c.strip() for c in m.group(1).replace("\n", "").split(",")]
-        for col in columns:
-            if not col: continue
-            if _loose_normalize(col) not in valid_attrs_loose:
-                issues.append({
-                    "sheet": sheet_name,
-                    "attribute": f"SQL Column: {col}",
-                    "level": "WARN",
-                    "category": "SQL_CONSISTENCY",
-                    "blocks_vobo": False,
-                    "message": f"La columna '{col}' del INSERT no se encontró explícitamente definida en la tabla."
-                })
-    return issues

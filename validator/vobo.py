@@ -1,7 +1,8 @@
 import pandas as pd
 from validator.statuscode import validate_error_definitions
 from validator.backend_mapping import validate_backend_mapping
-
+# Importamos el nuevo validador
+from validator.bian_validation import validate_bian_alignment
 
 def _dedupe_issues(issues: list[dict]) -> list[dict]:
     seen = set()
@@ -23,14 +24,20 @@ def _dedupe_issues(issues: list[dict]) -> list[dict]:
 def run_vobo(excel_path: str) -> dict:
     issues: list[dict] = []
 
-    # 1. Ejecutar validadores
+    # 1. Ejecutar validadores estructurales y técnicos (Lógica Determinista)
+    # Errores y Status Codes
     issues.extend(validate_error_definitions(excel_path).get("details", []))
+    # Mapeo Backend y Tipos
     issues.extend(validate_backend_mapping(excel_path).get("details", []))
 
-    # 2. Deduplicar
+    # 2. Ejecutar validador Semántico BIAN (Lógica IA)
+    # Nota: Esto consume API, si quieres que sea opcional, podrías poner un flag.
+    issues.extend(validate_bian_alignment(excel_path).get("details", []))
+
+    # 3. Deduplicar
     issues = _dedupe_issues(issues)
 
-    # 3. Política VoBo
+    # 4. Política VoBo
     blocking_issues = []
     for e in issues:
         # Solo bloquea si es explícitamente ERROR o blocks_vobo=True
@@ -39,14 +46,14 @@ def run_vobo(excel_path: str) -> dict:
 
     vobo_ok = len(blocking_issues) == 0
 
-    # 4. Mensaje Final Personalizado
+    # 5. Mensaje Final Personalizado
     if vobo_ok:
-        if issues:  # Si vobo=OK pero hay items en la lista (significa que son Warnings)
-            main_message = "⚠️ Se aprueba el VoBo, pero se tienen estas sugerencias"
+        if issues:
+            main_message = "⚠️ **VoBo Aprobado con Observaciones**\nEl archivo cumple la estructura técnica, pero revisa las sugerencias BIAN y advertencias."
         else:
-            main_message = "✅ La matriz de transformación ha aprobado el VoBo correctamente."
+            main_message = "✅ **VoBo Aprobado Exitosamente**\nLa matriz de transformación es perfecta."
     else:
-        main_message = "❌ La matriz de transformación NO aprueba el VoBo."
+        main_message = "❌ **VoBo Rechazado**\nSe encontraron errores bloqueantes en la estructura o contrato."
 
     return {
         "vobo": vobo_ok,
