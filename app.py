@@ -6,14 +6,12 @@ from validator.vobo import run_vobo
 from llm.intent_classifier import classify_intent
 from llm.advisor import explain_errors, explain_error  # backward compat
 
-
 st.set_page_config(
     page_title="Agente VoBo – Matriz de Transformación",
     layout="wide"
 )
 
 st.title("🤖 Agente de Gobierno – VoBo Matriz de Transformación")
-
 
 # -----------------------------
 # Session state
@@ -36,14 +34,12 @@ if "uploader_key" not in st.session_state:
 if "last_uploaded_name" not in st.session_state:
     st.session_state.last_uploaded_name = None
 
-
 # -----------------------------
 # Render chat history
 # -----------------------------
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
-
 
 # -----------------------------
 # File uploader
@@ -55,10 +51,10 @@ uploaded_file = st.file_uploader(
 )
 
 should_load_file = (
-    uploaded_file is not None and (
+        uploaded_file is not None and (
         (not st.session_state.file_loaded)
         or (uploaded_file.name != st.session_state.last_uploaded_name)
-    )
+)
 )
 
 if should_load_file:
@@ -76,7 +72,6 @@ if should_load_file:
     })
 
     st.rerun()
-
 
 # -----------------------------
 # Load another file
@@ -153,7 +148,7 @@ if user_input:
             issues = result.get("details", [])
             st.session_state.context["errors"] = issues
 
-            # Separa bloqueantes vs warnings (si trae blocks_vobo)
+            # Separa bloqueantes vs warnings
             blocking = [e for e in issues if e.get("blocks_vobo") is True or e.get("level") == "ERROR"]
             warnings = [e for e in issues if e.get("level") == "WARN" and e not in blocking]
 
@@ -162,28 +157,43 @@ if user_input:
             else:
                 response = "❌ **La matriz de transformación NO aprueba el VoBo**\n\n"
 
+
+            # --- FUNCIÓN AUXILIAR PARA FORMATO ---
+            def format_issue_line(err):
+                sheet_raw = str(err.get("sheet", "¿?")).strip()
+                attr = err.get("attribute", "¿?")
+                cell = err.get("cell", "")  # Dato nuevo (si existe)
+                msg = err.get("message", "")
+
+                # 1. Evitar "Hoja Hoja 4" -> "Hoja 4"
+                if sheet_raw.lower().startswith("hoja"):
+                    sheet_display = f"**{sheet_raw}**"
+                else:
+                    sheet_display = f"Hoja **{sheet_raw}**"
+
+                # 2. Agregar Celda si existe
+                location_str = sheet_display
+                if cell:
+                    location_str += f" (Celda `{cell}`)"
+
+                line = f"- {location_str} | Atributo `{attr}`"
+                if msg:
+                    line += f"  \n  ↳ {msg}"
+                return line
+
+
+            # -------------------------------------
+
             if blocking:
                 response += "## ❌ Errores que bloquean\n"
                 for err in blocking:
-                    sheet = err.get("sheet", "¿?")
-                    attr = err.get("attribute", "¿?")
-                    msg = err.get("message", "")
-                    response += f"- Hoja **{sheet}** | Atributo `{attr}`"
-                    if msg:
-                        response += f"  \n  ↳ {msg}"
-                    response += "\n"
+                    response += format_issue_line(err) + "\n"
                 response += "\n"
 
             if warnings:
                 response += "## ⚠️ Advertencias\n"
                 for err in warnings:
-                    sheet = err.get("sheet", "¿?")
-                    attr = err.get("attribute", "¿?")
-                    msg = err.get("message", "")
-                    response += f"- Hoja **{sheet}** | Atributo `{attr}`"
-                    if msg:
-                        response += f"  \n  ↳ {msg}"
-                    response += "\n"
+                    response += format_issue_line(err) + "\n"
 
             if issues:
                 response += "\nPuedes pedirme que **explique un error o advertencia** (por hoja/atributo)."
