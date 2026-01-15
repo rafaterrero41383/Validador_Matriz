@@ -23,6 +23,17 @@ KEYWORDS_TO_SKIP = {
 # HELPERS
 # =============================================================================
 
+def _get_excel_coord(row_idx, col_idx):
+    """Convierte indices (0, 0) a coordenadas Excel (A1)."""
+    if row_idx is None or col_idx is None: return ""
+    col_str = ""
+    col_num = col_idx + 1
+    while col_num > 0:
+        col_num, remainder = divmod(col_num - 1, 26)
+        col_str = chr(65 + remainder) + col_str
+    return f"{col_str}{row_idx + 1}"
+
+
 def _normalize(text: str) -> str:
     return text.strip().lower() if isinstance(text, str) else ""
 
@@ -31,7 +42,8 @@ def _loose_normalize(text: str) -> str:
     if not isinstance(text, str): return ""
     clean = str(text).strip().lower()
     if "." in clean: clean = clean.split(".")[-1]
-    return clean.replace("_", "").replace(" ", "")
+    # CAMBIO: Mantenemos el guion bajo "_" para validación estricta
+    return clean.replace(" ", "")
 
 
 def _get_type_family(type_str: str) -> str:
@@ -45,7 +57,7 @@ def _is_mandatory(val: str) -> bool:
     return v in ["si", "yes", "s", "y", "true", "requerido", "required", "mandatory", "mandatorio", "1"]
 
 
-def _validate_array_syntax(attr_name, dtype, sheet, issues_list):
+def _validate_array_syntax(attr_name, dtype, sheet, issues_list, cell_ref=""):
     name = str(attr_name).strip()
     dt = str(dtype).strip().lower()
     if not name or not dt or dt == "nan": return
@@ -56,11 +68,13 @@ def _validate_array_syntax(attr_name, dtype, sheet, issues_list):
     if has_brackets_at_end and not is_array:
         issues_list.append({
             "sheet": sheet, "attribute": name, "level": "WARN", "category": "SYNTAX",
+            "cell": cell_ref,
             "message": f"Sintaxis: Termina en '[]' pero el tipo es '{dtype}'. Debería ser 'Array'."
         })
     elif is_array and not has_brackets_at_end:
         issues_list.append({
             "sheet": sheet, "attribute": name, "level": "WARN", "category": "SYNTAX",
+            "cell": cell_ref,
             "message": f"Sintaxis: Es tipo 'Array' pero no termina en '[]'."
         })
 
@@ -103,7 +117,8 @@ def _load_contract_definitions(df: pd.DataFrame, sheet_name: str, issues: list) 
         if not raw_a or raw_a.lower() in ["nan", "n/a"]: continue
         if norm in KEYWORDS_TO_SKIP: continue
 
-        _validate_array_syntax(raw_a, raw_t, sheet_name, issues)
+        current_cell = _get_excel_coord(i, idx_a)
+        _validate_array_syntax(raw_a, raw_t, sheet_name, issues, cell_ref=current_cell)
 
         fam = _get_type_family(raw_t)
         if fam != "UNKNOWN" or _normalize(raw_o) in ["yes", "no", "si"]:
@@ -112,7 +127,7 @@ def _load_contract_definitions(df: pd.DataFrame, sheet_name: str, issues: list) 
 
 
 # =============================================================================
-# SQL PARSERS (CORREGIDO PARA UPDATE)
+# SQL PARSERS
 # =============================================================================
 
 def _extract_sql_columns(sql_text: str) -> tuple[str, set]:
@@ -131,23 +146,15 @@ def _extract_sql_columns(sql_text: str) -> tuple[str, set]:
                 if c.strip(): cols.add(_loose_normalize(c.strip()))
             return "INSERT", cols
 
-    # --- CASO UPDATE (CORREGIDO) ---
+    # --- CASO UPDATE ---
     if "UPDATE" in clean.upper() and "SET" in clean.upper():
-        # Estrategia: Buscar palabras seguidas de un signo =
-        # Ej: "SET status=?, date=?" -> status, date
-        # Ej: "WHERE id=?" -> id
-
-        # Regex: Captura cualquier palabra alfanumérica seguida inmediatamente de un =
-        # La limpieza previa eliminó espacios alrededor del =
         matches = re.findall(r"([a-zA-Z0-9_\.]+)=[\?a-zA-Z0-9_']", clean)
         for m in matches:
             cols.add(_loose_normalize(m))
-
-        return "INSERT", cols  # Retornamos tipo INSERT para indicar "Escritura" (Input Only)
+        return "INSERT", cols
 
     # --- CASO DELETE ---
     if "DELETE" in clean.upper() and "FROM" in clean.upper():
-        # En DELETE solo nos importa el WHERE
         matches = re.findall(r"([a-zA-Z0-9_\.]+)=[\?a-zA-Z0-9_']", clean)
         for m in matches:
             cols.add(_loose_normalize(m))
@@ -208,7 +215,7 @@ def validate_backend_mapping(excel_path: str) -> dict:
                 curr_sect = "INPUT";
                 continue
 
-            # Fin de lectura por SQL
+            # Fin de lectura por SQL (simple check inicial)
             if "insert into" in txt or "select " in txt or "update " in txt or "delete " in txt:
                 break
 
@@ -224,55 +231,69 @@ def validate_backend_mapping(excel_path: str) -> dict:
 
             # --- Recolección estricta ---
             val_to_add = None
+            val_col_idx = None
 
             if curr_sect == "INPUT" and len(a_cols) > 1:
                 raw = str(row.iloc[a_cols[1]]).strip()
                 if raw and raw.lower() not in ["nan", "n/a", ""]:
                     in_dest.add(_loose_normalize(raw))
                     val_to_add = raw
+                    val_col_idx = a_cols[1]
 
             elif curr_sect == "OUTPUT" and len(a_cols) > 0:
                 raw = str(row.iloc[a_cols[0]]).strip()
-                # Filtrado extra fuerte para Output vacíos
                 if raw and raw.lower() not in ["nan", "n/a", ""] and not raw.isspace():
                     out_orig.add(_loose_normalize(raw))
                     val_to_add = raw
+                    val_col_idx = a_cols[0]
 
             # Validar Array Syntax (Solo si detectamos un valor real)
             if val_to_add:
-                chk_a, chk_t = a_cols[0], t_cols[0]
+                chk_t = t_cols[0]
                 if curr_sect == "INPUT" and len(a_cols) > 1:
-                    chk_a, chk_t = a_cols[1], (t_cols[1] if len(t_cols) > 1 else t_cols[0])
+                    chk_t = (t_cols[1] if len(t_cols) > 1 else t_cols[0])
 
                 try:
                     t_val = str(row.iloc[chk_t]).strip()
                     if t_val and t_val.lower() != "nan":
-                        _validate_array_syntax(val_to_add, t_val, sh, issues)
+                        current_cell = _get_excel_coord(r_idx, val_col_idx)
+                        _validate_array_syntax(val_to_add, t_val, sh, issues, cell_ref=current_cell)
                 except:
                     pass
 
-        # --- SQL Check ---
-        sql_t, sql_c = _extract_sql_columns(df.to_string())
+        # === SOLUCIÓN ROBUSTA: Unir texto celda por celda ===
+        # Esto evita que Pandas corte líneas largas, agregue índices de fila o 'NaN'
+        raw_text_parts = []
+        for r_i in range(len(df)):
+            for c_i in range(len(df.columns)):
+                val = str(df.iloc[r_i, c_i]).strip()
+                # Solo agregamos si tiene texto y no es un valor nulo
+                if val and val.lower() not in ['nan', 'none', 'n/a']:
+                    raw_text_parts.append(val)
+
+        full_text = " ".join(raw_text_parts)
+        sql_t, sql_c = _extract_sql_columns(full_text)
 
         if sql_t == "SELECT":
             if not out_orig:
-                issues.append({"sheet": sh, "attribute": "Estructura Output", "level": "ERROR", "blocks_vobo": True,
-                               "category": "SQL_CONSISTENCY", "message": "SELECT presente pero Backend-Output vacío."})
-            elif (out_orig - sql_c):
-                issues.append({"sheet": sh, "attribute": "SQL Consistency", "level": "ERROR", "blocks_vobo": True,
+                issues.append({"sheet": sh, "attribute": "Estructura Output", "level": "WARN",
                                "category": "SQL_CONSISTENCY",
-                               "message": f"SELECT incompleto. Faltan en SQL: {', '.join(out_orig - sql_c)}"})
+                               "message": "Se detectó una incongruencia: SELECT presente pero Backend-Output vacío."})
+            elif (out_orig - sql_c):
+                issues.append({"sheet": sh, "attribute": "SQL Consistency", "level": "WARN",
+                               "category": "SQL_CONSISTENCY",
+                               "message": f"Se detectó una incongruencia entre los atributos y la consulta de BD. Se sugiere renombrar el atributo. (Discrepancias: {', '.join(out_orig - sql_c)})"})
 
         elif sql_t == "INSERT":  # Aplica para INSERT, UPDATE, DELETE
             if out_orig:
-                issues.append({"sheet": sh, "attribute": "Estructura Output", "level": "ERROR", "blocks_vobo": True,
+                issues.append({"sheet": sh, "attribute": "Estructura Output", "level": "WARN",
                                "category": "SQL_CONSISTENCY",
-                               "message": "Operación de escritura presente pero Backend-Output tiene datos (debería estar vacío)."})
+                               "message": "Operación de escritura presente pero Backend-Output tiene datos."})
 
             missing = in_dest - sql_c
             if missing:
-                issues.append({"sheet": sh, "attribute": "SQL Consistency", "level": "ERROR", "blocks_vobo": True,
+                issues.append({"sheet": sh, "attribute": "SQL Consistency", "level": "WARN",
                                "category": "SQL_CONSISTENCY",
-                               "message": f"Operación incompleta. Atributos del mapeo no encontrados en SQL: {', '.join(missing)}"})
+                               "message": f"Se detectó una incongruencia entre los atributos y la consulta de BD. Se sugiere renombrar el atributo. (Discrepancias: {', '.join(missing)})"})
 
     return {"details": issues}

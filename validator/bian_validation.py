@@ -135,23 +135,22 @@ def _extract_candidates_backend(df: pd.DataFrame) -> list:
 
 
 # =============================================================================
-# LÓGICA IA (Prompt Relajado)
+# LÓGICA IA (PROMPT EXTREMADAMENTE TOLERANTE)
 # =============================================================================
 
 def _consult_semantic_expert(candidates: list, context_type: str) -> list:
     if not candidates: return []
 
-    # MENSAJE DE SISTEMA AJUSTADO PARA SER TOLERANTE
+    # CAMBIO: Prompt diseñado para ignorar discrepancias de negocio y solo ver absurdos.
     system_prompt = (
-        "Eres un Auditor Técnico de Datos. Tu tarea es detectar INCONGRUENCIAS GRAVES entre el nombre de un atributo y su descripción.\n\n"
-        "REGLAS DE ORO (MODO TOLERANTE):\n"
-        "1. NO reportes descripciones 'vagas' o 'genéricas' (ej. 'Status del cliente' para 'client_status' es CORRECTO).\n"
-        "2. NO sugieras cambios de estilo (ej. no pidas cambiar 'rfc' por 'tax_id' si 'rfc' es un término local válido).\n"
-        "3. NO reportes atributos repetidos en listas (ej. 'code' o 'message' repetidos es normal).\n"
-        "4. SOLO REPORTA CONTRADICCIONES LÓGICAS EVIDENTES.\n"
-        "   - Ejemplo de ERROR: Nombre='city', Descripción='Es el saldo de la cuenta'. (Ciudad vs Dinero -> ERROR).\n"
-        "   - Ejemplo de ERROR: Nombre='latitude', Descripción='Nombre del cliente'. (Coordenada vs Texto -> ERROR).\n\n"
-        "Analiza la lista y devuelve un JSON con 'issues' SOLO para esos casos graves."
+        "Eres un validador de datos bancarios extremadamente permisivo y silencioso. "
+        "Tu única tarea es detectar ERRORES CATASTRÓFICOS de coherencia (ej: Fecha vs Dinero).\n\n"
+        "REGLAS OBLIGATORIAS:\n"
+        "1. IGNORA discrepancias de negocio: Si el atributo es 'client_id' y la descripción dice 'Unidad de Negocio' o 'Institución', ES VÁLIDO. Asume que hay una lógica interna que desconoces.\n"
+        "2. IGNORA descripciones vagas: Si la descripción es 'identificador', 'código', o similar, ES VÁLIDO.\n"
+        "3. SOLO REPORTA CONTRADICCIONES IMPOSIBLES: Por ejemplo, un campo llamado 'fecha_nacimiento' con descripción 'Saldo en pesos'.\n"
+        "4. Ante la mínima duda de que pueda ser correcto, NO REPORTES NADA. Devuelve lista vacía.\n\n"
+        "Analiza la lista y devuelve un JSON con 'issues' SOLO para esos casos imposibles."
     )
 
     clean_candidates = [{"attribute": c["attribute"], "description": c["description"]} for c in candidates]

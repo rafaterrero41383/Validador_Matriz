@@ -1,7 +1,6 @@
 import pandas as pd
 from validator.statuscode import validate_error_definitions
 from validator.backend_mapping import validate_backend_mapping
-# Importamos el nuevo validador
 from validator.bian_validation import validate_bian_alignment
 
 def _dedupe_issues(issues: list[dict]) -> list[dict]:
@@ -24,32 +23,35 @@ def _dedupe_issues(issues: list[dict]) -> list[dict]:
 def run_vobo(excel_path: str) -> dict:
     issues: list[dict] = []
 
-    # 1. Ejecutar validadores estructurales y técnicos (Lógica Determinista)
-    # Errores y Status Codes
+    # 1. Ejecutar validadores
     issues.extend(validate_error_definitions(excel_path).get("details", []))
-    # Mapeo Backend y Tipos
     issues.extend(validate_backend_mapping(excel_path).get("details", []))
-
-    # 2. Ejecutar validador Semántico BIAN (Lógica IA)
-    # Nota: Esto consume API, si quieres que sea opcional, podrías poner un flag.
     issues.extend(validate_bian_alignment(excel_path).get("details", []))
 
-    # 3. Deduplicar
+    # 2. Deduplicar
     issues = _dedupe_issues(issues)
 
-    # 4. Política VoBo
+    # 3. Política VoBo
+    # Regla base: Bloquea si es ERROR explícito
     blocking_issues = []
     for e in issues:
-        # Solo bloquea si es explícitamente ERROR o blocks_vobo=True
         if e.get("blocks_vobo") is True or e.get("level") == "ERROR":
             blocking_issues.append(e)
 
     vobo_ok = len(blocking_issues) == 0
 
-    # 5. Mensaje Final Personalizado
-    if vobo_ok:
+    # CAMBIO 3: Regla de límite de tolerancia (Strike 3)
+    # Si ya estaba aprobado por errores críticos, revisamos si tiene demasiados warnings
+    if vobo_ok and len(issues) > 3:
+        vobo_ok = False
+        main_message = (
+            "❌ **VoBo Rechazado (Exceso de hallazgos)**\n"
+            "Aunque no hay errores de estructura críticos, el archivo tiene más de 3 observaciones.\n\n"
+            "**Resuelva estos problemas para proceder a dar el VoBo a la matriz de Transformación.**"
+        )
+    elif vobo_ok:
         if issues:
-            main_message = "⚠️ **VoBo Aprobado con Observaciones**\nEl archivo cumple la estructura técnica, pero revisa las sugerencias BIAN y advertencias."
+            main_message = "⚠️ **VoBo Aprobado con Observaciones**\nEl archivo cumple la estructura técnica, pero revisa las sugerencias."
         else:
             main_message = "✅ **VoBo Aprobado Exitosamente**\nLa matriz de transformación es perfecta."
     else:

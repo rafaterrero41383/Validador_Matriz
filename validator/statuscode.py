@@ -4,14 +4,10 @@ import os
 import json
 from openai import OpenAI
 
-# Configuración de Cliente OpenAI
 client = None
 if os.getenv("OPENAI_API_KEY"):
     client = OpenAI()
 
-# =============================================================================
-# CONSTANTES DE TIPOS (Para detección inteligente)
-# =============================================================================
 TYPE_KEYWORDS = {
     "string", "varchar", "char", "text", "number", "decimal", "int", "integer",
     "date", "datetime", "boolean", "bool", "object", "array"
@@ -19,8 +15,18 @@ TYPE_KEYWORDS = {
 
 
 # =============================================================================
-# HELPERS DE PARSEO
+# HELPERS
 # =============================================================================
+
+def _get_excel_coord(row_idx, col_idx):
+    if row_idx is None or col_idx is None: return ""
+    col_str = ""
+    col_num = col_idx + 1
+    while col_num > 0:
+        col_num, remainder = divmod(col_num - 1, 26)
+        col_str = chr(65 + remainder) + col_str
+    return f"{col_str}{row_idx + 1}"
+
 
 def _normalize(text):
     return str(text).strip().lower() if text else ""
@@ -38,13 +44,11 @@ def _is_output(val: str) -> bool:
 
 def _looks_like_type(val: str) -> bool:
     v = _normalize(str(val))
-    # Limpiamos paréntesis ej: varchar(50) -> varchar
     v = v.split("(")[0].strip()
     return v in TYPE_KEYWORDS
 
 
-def _validate_array_syntax(attr_name, dtype, sheet_name, issues_list):
-    """Regla: [] al FINAL del nombre <-> Tipo Array"""
+def _validate_array_syntax(attr_name, dtype, sheet_name, issues_list, cell_ref=""):
     name = str(attr_name).strip()
     dt = str(dtype).strip().lower()
 
@@ -56,17 +60,18 @@ def _validate_array_syntax(attr_name, dtype, sheet_name, issues_list):
     if has_brackets_at_end and not is_array:
         issues_list.append({
             "sheet": sheet_name, "attribute": name, "level": "WARN", "category": "SYNTAX",
+            "cell": cell_ref,
             "message": f"Sintaxis: El nombre termina en '[]' pero el tipo es '{dtype}'. Debería ser 'Array'."
         })
     elif is_array and not has_brackets_at_end:
         issues_list.append({
             "sheet": sheet_name, "attribute": name, "level": "WARN", "category": "SYNTAX",
+            "cell": cell_ref,
             "message": f"Sintaxis: El tipo es 'Array' pero no termina en '[]'."
         })
 
 
 def _extract_summary_table(df: pd.DataFrame):
-    """Busca la tabla de resumen 'Gestión Códigos de Errores'."""
     summary = []
     start_row = None
 
@@ -115,111 +120,89 @@ def _extract_summary_table(df: pd.DataFrame):
 
 
 def _parse_detailed_blocks(df: pd.DataFrame):
-    """Escanea la hoja buscando bloques 'StatusCode = X' con lectura FLEXIBLE."""
     blocks = {}
     current_code = None
-    regex_header = re.compile(r"status\s*code\s*=\s*(\d+)", re.IGNORECASE)
+    regex_header = re.compile(r"status\s*code\s*[:=]?\s*(\d+)", re.IGNORECASE)
 
     for i, row in df.iterrows():
         row_text = " ".join([str(x) for x in row if pd.notna(x)])
 
-        # 1. Detectar cabecera de bloque (Fila Amarilla)
         match = regex_header.search(row_text)
         if match:
             current_code = int(match.group(1))
             blocks[current_code] = []
             continue
 
-        # 2. Leer atributos dentro del bloque
         if current_code is not None:
-            # Saltamos encabezados repetidos
             if "atributo" in row_text.lower() and "tipo" in row_text.lower(): continue
 
-            # Recolectamos celdas no vacías de la fila
             clean_cells = []
-            for val in row:
+            attr_found = False
+            attr_val = ""
+            attr_col = -1
+
+            for col_idx, val in enumerate(row):
                 s = str(val).strip()
                 if s and s.lower() != 'nan':
                     clean_cells.append(s)
+                    if not attr_found:
+                        attr_val = s
+                        attr_col = col_idx
+                        attr_found = True
 
             if not clean_cells: continue
 
-            # --- LECTURA INTELIGENTE ---
-            # En lugar de usar índices fijos (row[1], row[4]), buscamos por contenido.
-            # Asumimos que el Atributo es el PRIMER valor no vacío.
-            raw_attr = clean_cells[0]
-
-            # El resto lo buscamos en las celdas siguientes
-            raw_io = ""
-            raw_mand = ""
-            raw_type = ""
+            raw_attr = attr_val
+            raw_io, raw_mand, raw_type = "", "", ""
 
             for cell in clean_cells[1:]:
                 c_low = cell.lower()
-
-                # Detectar Mandatorio
                 if c_low in ["yes", "no", "si"] and not raw_mand:
                     raw_mand = cell
                     continue
-
-                # Detectar IO
                 if any(x in c_low for x in ["entrada", "salida", "output", "input"]) and not raw_io:
                     raw_io = cell
                     continue
-
-                # Detectar Tipo
                 if _looks_like_type(c_low) and not raw_type:
                     raw_type = cell
                     continue
 
-            # Si logramos identificar al menos Atributo y (Tipo o Mandatorio), lo guardamos
             if raw_attr and (raw_type or raw_mand):
                 blocks[current_code].append({
                     "attribute": raw_attr,
-                    "io": raw_io,  # Puede quedar vacía si falla detección
+                    "io": raw_io,
                     "mandatory": raw_mand,
-                    "type": raw_type
+                    "type": raw_type,
+                    "cell": _get_excel_coord(i, attr_col)
                 })
 
     return blocks
 
 
-# =============================================================================
-# VALIDACIÓN CON LLM
-# =============================================================================
-
 def _check_coherence_with_llm(summary_list):
     if not client: return []
-
     clean_list = [{"code": x["code"], "alias": x["alias"], "desc": x["description"]} for x in summary_list]
 
-    # PROMPT TOLERANTE
+    # CAMBIO IMPORTANTE: Prompt ajustado para eliminar ruido
     prompt = (
-        "Analiza la coherencia semántica de estos códigos de error HTTP. "
-        "Detecta CONTRADICCIONES GRAVES (ej. 200 descrito como Error, 404 como Éxito). "
-        "Si la descripción es razonable, NO reportes nada. "
-        "Devuelve JSON: { \"issues\": [ { \"code\": 400, \"message\": \"Razón clara\" } ] }"
+        "Eres un validador estricto de APIs. Analiza la coherencia entre Códigos HTTP y Descripciones. "
+        "REGLA DE ORO: Si la descripción es estándar, correcta o razonable para el código, IGNÓRALA. "
+        "NO devuelvas nada si está bien. "
+        "SOLO reporta si hay una CONTRADICCIÓN SEMÁNTICA GRAVE (Ej: 200 dice 'Error Interno', 500 dice 'Éxito'). "
+        "Devuelve JSON: { \"issues\": [ { \"code\": 0, \"message\": \"Explica la contradicción\" } ] } "
+        "Si todo está bien, devuelve issues vacío."
     )
-
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": json.dumps(clean_list)}
-            ],
-            temperature=0,
-            response_format={"type": "json_object"}
+            messages=[{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(clean_list)}],
+            temperature=0, response_format={"type": "json_object"}
         )
         data = json.loads(response.choices[0].message.content)
         return data.get("issues", [])
-    except Exception:
+    except:
         return []
 
-
-# =============================================================================
-# LÓGICA PRINCIPAL
-# =============================================================================
 
 def validate_error_definitions(excel_path: str) -> dict:
     issues = []
@@ -227,27 +210,19 @@ def validate_error_definitions(excel_path: str) -> dict:
         xls = pd.ExcelFile(excel_path)
         sheet_name = xls.sheet_names[0]
         df = pd.read_excel(excel_path, sheet_name=sheet_name, header=None)
-    except Exception as e:
+    except:
         return {"details": []}
 
-    # 1. Resumen
     summary_codes = _extract_summary_table(df)
-
-    # 2. IA Check
     llm_issues = _check_coherence_with_llm(summary_codes)
     for i in llm_issues:
-        msg = str(i.get('message', '')).lower()
-        if "correcto" in msg or "adecuado" in msg or "valido" in msg: continue
-
         issues.append({
             "sheet": sheet_name, "attribute": f"StatusCode {i.get('code')}", "level": "WARN", "category": "SEMANTIC",
             "message": f"🤖 IA Semántica: {i.get('message')}"
         })
 
-    # 3. Detalles
     defined_blocks = _parse_detailed_blocks(df)
 
-    # 4. Validar Respuestas Exitosas (200 vs 204)
     success_codes = [c for c in defined_blocks.keys() if 200 <= c < 300]
     if not success_codes:
         issues.append({"sheet": sheet_name, "attribute": "StatusCode 2xx", "level": "WARN",
@@ -261,7 +236,6 @@ def validate_error_definitions(excel_path: str) -> dict:
         code = item.get('code')
         if not code: continue
 
-        # A) Existencia del bloque (errores)
         if code not in defined_blocks:
             if 400 <= code < 600:
                 issues.append(
@@ -271,7 +245,6 @@ def validate_error_definitions(excel_path: str) -> dict:
 
         attrs = defined_blocks[code]
 
-        # B) Reglas 200 vs 204
         if code == 204 and len(attrs) > 0:
             issues.append(
                 {"sheet": sheet_name, "attribute": f"StatusCode {code}", "level": "ERROR", "blocks_vobo": True,
@@ -281,31 +254,30 @@ def validate_error_definitions(excel_path: str) -> dict:
                 {"sheet": sheet_name, "attribute": f"StatusCode {code}", "level": "ERROR", "blocks_vobo": True,
                  "category": "STATUSCODE", "message": "200 OK debe tener atributos."})
 
-        # C) Validación de Atributos
         found_names = set()
         for attr in attrs:
-            _validate_array_syntax(attr['attribute'], attr['type'], sheet_name, issues)
+            _validate_array_syntax(attr['attribute'], attr['type'], sheet_name, issues, cell_ref=attr.get('cell', ''))
             found_names.add(_normalize(attr['attribute']))
 
-            # Validaciones estrictas para Errores Estándar (4xx/5xx)
             if 400 <= code < 600:
                 name = _normalize(attr['attribute'])
                 if name in ["code", "message", "description"]:
-                    # Validamos lo que pudimos extraer
                     if attr['type'] and "string" not in _normalize(attr['type']):
                         issues.append(
                             {"sheet": sheet_name, "attribute": f"Error {code}.{attr['attribute']}", "level": "ERROR",
+                             "cell": attr.get('cell', ''),
                              "message": f"Debe ser String (se detectó '{attr['type']}')."})
                     if attr['mandatory'] and not _is_mandatory(attr['mandatory']):
                         issues.append(
                             {"sheet": sheet_name, "attribute": f"Error {code}.{attr['attribute']}", "level": "ERROR",
+                             "cell": attr.get('cell', ''),
                              "message": "Debe ser Obligatorio."})
                     if attr['io'] and not _is_output(attr['io']):
                         issues.append(
                             {"sheet": sheet_name, "attribute": f"Error {code}.{attr['attribute']}", "level": "ERROR",
+                             "cell": attr.get('cell', ''),
                              "message": "Debe ser de Salida."})
 
-        # D) Estructura Incompleta en Errores
         if 400 <= code < 600:
             required = {"code", "message", "description"}
             missing = required - found_names
