@@ -61,12 +61,14 @@ def _validate_array_syntax(attr_name, dtype, sheet_name, issues_list, cell_ref="
         issues_list.append({
             "sheet": sheet_name, "attribute": name, "level": "WARN", "category": "SYNTAX",
             "cell": cell_ref,
+            # TEXTO UNIFICADO
             "message": f"Sintaxis: El nombre termina en '[]' pero el tipo es '{dtype}'. Debería ser 'Array'."
         })
     elif is_array and not has_brackets_at_end:
         issues_list.append({
             "sheet": sheet_name, "attribute": name, "level": "WARN", "category": "SYNTAX",
             "cell": cell_ref,
+            # TEXTO UNIFICADO
             "message": f"Sintaxis: El tipo es 'Array' pero no termina en '[]'."
         })
 

@@ -42,7 +42,7 @@ def _loose_normalize(text: str) -> str:
     if not isinstance(text, str): return ""
     clean = str(text).strip().lower()
     if "." in clean: clean = clean.split(".")[-1]
-    # CAMBIO: Mantenemos el guion bajo "_" para validación estricta
+    # Mantenemos guion bajo
     return clean.replace(" ", "")
 
 
@@ -69,13 +69,15 @@ def _validate_array_syntax(attr_name, dtype, sheet, issues_list, cell_ref=""):
         issues_list.append({
             "sheet": sheet, "attribute": name, "level": "WARN", "category": "SYNTAX",
             "cell": cell_ref,
-            "message": f"Sintaxis: Termina en '[]' pero el tipo es '{dtype}'. Debería ser 'Array'."
+            # TEXTO UNIFICADO
+            "message": f"Sintaxis: El nombre termina en '[]' pero el tipo es '{dtype}'. Debería ser 'Array'."
         })
     elif is_array and not has_brackets_at_end:
         issues_list.append({
             "sheet": sheet, "attribute": name, "level": "WARN", "category": "SYNTAX",
             "cell": cell_ref,
-            "message": f"Sintaxis: Es tipo 'Array' pero no termina en '[]'."
+            # TEXTO UNIFICADO
+            "message": f"Sintaxis: El tipo es 'Array' pero no termina en '[]'."
         })
 
 
@@ -131,14 +133,11 @@ def _load_contract_definitions(df: pd.DataFrame, sheet_name: str, issues: list) 
 # =============================================================================
 
 def _extract_sql_columns(sql_text: str) -> tuple[str, set]:
-    # Limpieza: quitamos comentarios, saltos de línea y espacios extra
     clean = re.sub(r"--.*", "", sql_text).replace("\n", " ").strip()
-    # Normalizar espacios alrededor de signos
     clean = re.sub(r"\s*=\s*", "=", clean)
 
     cols = set()
 
-    # --- CASO INSERT ---
     if "INSERT INTO" in clean.upper():
         m = re.search(r"INSERT\s+INTO\s+.*?\((.*?)\)\s*VALUES", clean, re.IGNORECASE)
         if m:
@@ -146,21 +145,18 @@ def _extract_sql_columns(sql_text: str) -> tuple[str, set]:
                 if c.strip(): cols.add(_loose_normalize(c.strip()))
             return "INSERT", cols
 
-    # --- CASO UPDATE ---
     if "UPDATE" in clean.upper() and "SET" in clean.upper():
         matches = re.findall(r"([a-zA-Z0-9_\.]+)=[\?a-zA-Z0-9_']", clean)
         for m in matches:
             cols.add(_loose_normalize(m))
         return "INSERT", cols
 
-    # --- CASO DELETE ---
     if "DELETE" in clean.upper() and "FROM" in clean.upper():
         matches = re.findall(r"([a-zA-Z0-9_\.]+)=[\?a-zA-Z0-9_']", clean)
         for m in matches:
             cols.add(_loose_normalize(m))
         return "INSERT", cols
 
-    # --- CASO SELECT ---
     if "SELECT" in clean.upper():
         m = re.search(r"SELECT\s+(.*?)\s+FROM", clean, re.IGNORECASE)
         if m:
@@ -201,13 +197,16 @@ def validate_backend_mapping(excel_path: str) -> dict:
         if start is None: continue
 
         in_dest, out_orig = set(), set()
+        # NUEVO: Mapas para recordar dónde está cada atributo (Nombre -> Celda)
+        in_dest_map, out_orig_map = {}, {}
+        sql_start_cell = ""  # Para marcar donde empieza el SQL
+
         curr_sect = "INPUT"
 
         for r_idx in range(len(df)):
             row = df.iloc[r_idx]
             txt = "".join([str(x) for x in row]).lower()
 
-            # Detección de secciones
             if "backend - output" in txt:
                 curr_sect = "OUTPUT";
                 continue
@@ -215,39 +214,42 @@ def validate_backend_mapping(excel_path: str) -> dict:
                 curr_sect = "INPUT";
                 continue
 
-            # Fin de lectura por SQL (simple check inicial)
             if "insert into" in txt or "select " in txt or "update " in txt or "delete " in txt:
+                # Guardamos donde empieza el SQL por si hay errores generales
+                sql_start_cell = _get_excel_coord(r_idx, 0)
                 break
 
             if r_idx <= start: continue
 
-            # --- Validar que la fila no sea un header repetido o basura ---
             try:
-                # Chequeamos la primera celda de atributo
                 cell_val = str(row.iloc[a_cols[0]]).strip().lower()
                 if cell_val in KEYWORDS_TO_SKIP or cell_val == "nan" or cell_val == "": continue
             except:
                 continue
 
-            # --- Recolección estricta ---
             val_to_add = None
             val_col_idx = None
 
             if curr_sect == "INPUT" and len(a_cols) > 1:
                 raw = str(row.iloc[a_cols[1]]).strip()
                 if raw and raw.lower() not in ["nan", "n/a", ""]:
-                    in_dest.add(_loose_normalize(raw))
-                    val_to_add = raw
+                    norm_name = _loose_normalize(raw)
+                    in_dest.add(norm_name)
+                    # Guardamos la celda
                     val_col_idx = a_cols[1]
+                    in_dest_map[norm_name] = _get_excel_coord(r_idx, val_col_idx)
+                    val_to_add = raw
 
             elif curr_sect == "OUTPUT" and len(a_cols) > 0:
                 raw = str(row.iloc[a_cols[0]]).strip()
                 if raw and raw.lower() not in ["nan", "n/a", ""] and not raw.isspace():
-                    out_orig.add(_loose_normalize(raw))
-                    val_to_add = raw
+                    norm_name = _loose_normalize(raw)
+                    out_orig.add(norm_name)
+                    # Guardamos la celda
                     val_col_idx = a_cols[0]
+                    out_orig_map[norm_name] = _get_excel_coord(r_idx, val_col_idx)
+                    val_to_add = raw
 
-            # Validar Array Syntax (Solo si detectamos un valor real)
             if val_to_add:
                 chk_t = t_cols[0]
                 if curr_sect == "INPUT" and len(a_cols) > 1:
@@ -262,38 +264,50 @@ def validate_backend_mapping(excel_path: str) -> dict:
                     pass
 
         # === SOLUCIÓN ROBUSTA: Unir texto celda por celda ===
-        # Esto evita que Pandas corte líneas largas, agregue índices de fila o 'NaN'
         raw_text_parts = []
         for r_i in range(len(df)):
             for c_i in range(len(df.columns)):
                 val = str(df.iloc[r_i, c_i]).strip()
-                # Solo agregamos si tiene texto y no es un valor nulo
                 if val and val.lower() not in ['nan', 'none', 'n/a']:
                     raw_text_parts.append(val)
 
         full_text = " ".join(raw_text_parts)
         sql_t, sql_c = _extract_sql_columns(full_text)
 
+        # LÓGICA DE DETECCIÓN DE CELDAS PARA ERRORES SQL
         if sql_t == "SELECT":
             if not out_orig:
                 issues.append({"sheet": sh, "attribute": "Estructura Output", "level": "WARN",
                                "category": "SQL_CONSISTENCY",
+                               "cell": sql_start_cell,  # Apuntamos al SQL
                                "message": "Se detectó una incongruencia: SELECT presente pero Backend-Output vacío."})
             elif (out_orig - sql_c):
+                missing_set = out_orig - sql_c
+                # Buscamos la celda del primer atributo que falta
+                first_missing = list(missing_set)[0]
+                target_cell = out_orig_map.get(first_missing, sql_start_cell)
+
                 issues.append({"sheet": sh, "attribute": "SQL Consistency", "level": "WARN",
                                "category": "SQL_CONSISTENCY",
-                               "message": f"Se detectó una incongruencia entre los atributos y la consulta de BD. Se sugiere renombrar el atributo. (Discrepancias: {', '.join(out_orig - sql_c)})"})
+                               "cell": target_cell,
+                               "message": f"Se detectó una incongruencia entre los atributos y la consulta de BD. Se sugiere renombrar el atributo. (Discrepancias: {', '.join(missing_set)})"})
 
-        elif sql_t == "INSERT":  # Aplica para INSERT, UPDATE, DELETE
+        elif sql_t == "INSERT":
             if out_orig:
                 issues.append({"sheet": sh, "attribute": "Estructura Output", "level": "WARN",
                                "category": "SQL_CONSISTENCY",
+                               "cell": sql_start_cell,
                                "message": "Operación de escritura presente pero Backend-Output tiene datos."})
 
             missing = in_dest - sql_c
             if missing:
+                # Buscamos la celda del primer atributo que falta
+                first_missing = list(missing)[0]
+                target_cell = in_dest_map.get(first_missing, sql_start_cell)
+
                 issues.append({"sheet": sh, "attribute": "SQL Consistency", "level": "WARN",
                                "category": "SQL_CONSISTENCY",
+                               "cell": target_cell,
                                "message": f"Se detectó una incongruencia entre los atributos y la consulta de BD. Se sugiere renombrar el atributo. (Discrepancias: {', '.join(missing)})"})
 
     return {"details": issues}

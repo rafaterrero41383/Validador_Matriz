@@ -135,29 +135,27 @@ def _extract_candidates_backend(df: pd.DataFrame) -> list:
 
 
 # =============================================================================
-# LÓGICA IA (PROMPT EXTREMADAMENTE TOLERANTE)
+# LÓGICA IA (PROMPT: SILENCIO SI ES CORRECTO)
 # =============================================================================
 
 def _consult_semantic_expert(candidates: list, context_type: str) -> list:
     if not candidates: return []
 
-    # CAMBIO: Prompt diseñado para ignorar discrepancias de negocio y solo ver absurdos.
+    # Prompt ajustado para eliminar "falsos positivos" o "comentarios educativos"
     system_prompt = (
-        "Eres un validador de datos bancarios extremadamente permisivo y silencioso. "
-        "Tu única tarea es detectar ERRORES CATASTRÓFICOS de coherencia (ej: Fecha vs Dinero).\n\n"
-        "REGLAS OBLIGATORIAS:\n"
-        "1. IGNORA discrepancias de negocio: Si el atributo es 'client_id' y la descripción dice 'Unidad de Negocio' o 'Institución', ES VÁLIDO. Asume que hay una lógica interna que desconoces.\n"
-        "2. IGNORA descripciones vagas: Si la descripción es 'identificador', 'código', o similar, ES VÁLIDO.\n"
-        "3. SOLO REPORTA CONTRADICCIONES IMPOSIBLES: Por ejemplo, un campo llamado 'fecha_nacimiento' con descripción 'Saldo en pesos'.\n"
-        "4. Ante la mínima duda de que pueda ser correcto, NO REPORTES NADA. Devuelve lista vacía.\n\n"
-        "Analiza la lista y devuelve un JSON con 'issues' SOLO para esos casos imposibles."
+        "Eres un Auditor de Coherencia de Datos estricto. Tu trabajo es detectar SOLO ERRORES GRAVES de dominio.\n"
+        "REGLAS:\n"
+        "1. REPORTA SOLO INCOMPATIBILIDADES: (Ej. 'city' descrito como 'producto', 'latitude' como 'dinero').\n"
+        "2. SILENCIO ABSOLUTO SI ES CORRECTO: Si el atributo es 'amount' y la descripción habla de dinero, NO LO INCLUYAS en el output.\n"
+        "3. NO QUEREMOS SUGERENCIAS LEVES: No incluyas mensajes como 'es correcto pero verifica...'. Solo errores.\n"
+        "JSON output: { \"issues\": [] } (Devuelve lista vacía si todo parece razonable)."
     )
 
     clean_candidates = [{"attribute": c["attribute"], "description": c["description"]} for c in candidates]
 
     user_content = (
-        f"Analiza:\n{json.dumps(clean_candidates, ensure_ascii=False)}\n\n"
-        "JSON output: { \"issues\": [ { \"attribute\": \"...\", \"suggestion\": \"...\", \"reason\": \"...\" } ] }"
+        f"Analiza estos pares Atributo-Descripción:\n{json.dumps(clean_candidates, ensure_ascii=False)}\n\n"
+        "JSON output: { \"issues\": [ { \"attribute\": \"...\", \"reason\": \"Explica el error\" } ] }"
     )
 
     try:
@@ -212,6 +210,13 @@ def validate_bian_alignment(excel_path: str) -> dict:
                 suggestions = _consult_semantic_expert(batch, context)
 
                 for s in suggestions:
+                    reason = s.get('reason', '')
+                    # FILTRO PYTHON: Doble seguridad
+                    # Si la IA dice "es correcto", "es adecuado", "parece bien", lo borramos.
+                    msg_lower = reason.lower()
+                    if "correcto" in msg_lower or "adecuado" in msg_lower or "válido" in msg_lower:
+                        continue
+
                     attr_name = s.get("attribute", "Desconocido")
                     cell_loc = attr_cell_map.get(attr_name, "")
 
@@ -221,7 +226,7 @@ def validate_bian_alignment(excel_path: str) -> dict:
                         "cell": cell_loc,
                         "level": "WARN",
                         "category": "SEMANTIC_BIAN",
-                        "message": f"🧠 Semántica: {s.get('reason')}. Sugerencia: {s.get('suggestion')}"
+                        "message": f"🧠 Semántica: {reason}"
                     })
 
         except Exception as e:
